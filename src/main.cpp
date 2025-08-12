@@ -19,10 +19,10 @@
 // ===================== 可調整參數 =====================
 // Raspberry Pi Pico / Pico 2 W 預設 I2C 腳位：SDA=4, SCL=5
 #ifndef I2C_SDA_PIN
-#define I2C_SDA_PIN 4
+#define I2C_SDA_PIN 0
 #endif
 #ifndef I2C_SCL_PIN
-#define I2C_SCL_PIN 5
+#define I2C_SCL_PIN 1
 #endif
 #define SERVO_FREQ      50          // 50 Hz for analog servos
 #define SERVO_MIN_PULSE 150         // 0° (PCA9685 12-bit)
@@ -35,8 +35,15 @@
 // Task 設定（RP2040 無多核心 pin-to-core API，使用 xTaskCreate）
 #define STACK_UROS   (6 * 1024)
 #define STACK_SERVO  (3 * 1024)
+#define STACK_LED    (2 * 1024)
 #define PRIO_UROS    3
 #define PRIO_SERVO   2
+#define PRIO_LED     1
+
+// LED（Pico / Pico W / Pico 2 W 在 Arduino Core 下通常為 LED_BUILTIN）
+#ifndef LED_PIN
+#define LED_PIN LED_BUILTIN
+#endif
 
 // ===================== 全域物件 =====================
 static Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
@@ -50,12 +57,13 @@ static rcl_subscription_t cmd_sub;
 static rcl_timer_t pub_timer;
 static rclc_executor_t executor;
 static std_msgs__msg__Float32 state_msg;
-static std_msgs__msg__Float32 cmd_msg; // Add this global variable
+static std_msgs__msg__Float32 cmd_msg; // <-- Add this global variable above
 
 // FreeRTOS 同步
 static QueueHandle_t angle_q;        // 接收要設定的角度（度）
 static SemaphoreHandle_t state_mtx;  // 保護 current_angle
 static volatile float current_angle_deg = 0.0f;  // 最新角度（由 SERVO 任務寫入）
+static volatile bool agent_connected = false;    // micro-ROS Agent 連線狀態
 
 // ===================== 工具函式 =====================
 static inline uint16_t angle_to_pulse(float deg)
@@ -106,12 +114,12 @@ static void task_micro_ros(void *arg)
   // set_microros_udp_transports(agent_ip, agent_port);
 #endif
 
-  // 等待 Agent 就緒
+  // 等待 Agent 就緒（LED 任務會依據 agent_connected 閃爍/常亮）
+  agent_connected = false;
   while (RMW_RET_OK != rmw_uros_ping_agent(100, 10)) {
-    Serial.println("Waiting for micro-ROS Agent...");
     vTaskDelay(pdMS_TO_TICKS(100));
   }
-  Serial.println("Agent ready");
+  agent_connected = true;
 
   allocator = rcl_get_default_allocator();
   rclc_support_init(&support, 0, NULL, &allocator);
@@ -140,22 +148,23 @@ static void task_micro_ros(void *arg)
   rclc_executor_add_subscription(&executor, &cmd_sub, &cmd_msg, &sub_cmd_callback, ON_NEW_DATA);
   rclc_executor_add_timer(&executor, &pub_timer);
 
-  // 進入 spin 迴圈（避免阻塞太久，使用 spin_some）
+  // 進入 spin 迴圈（同時每 1 秒偵測 Agent 是否仍在線）
+  TickType_t lastPingCheck = xTaskGetTickCount();
   for (;;) {
     rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5));
     vTaskDelay(pdMS_TO_TICKS(1));
+
+    if (xTaskGetTickCount() - lastPingCheck >= pdMS_TO_TICKS(1000)) {
+      lastPingCheck = xTaskGetTickCount();
+      // timeout 0.1s、重試 1 次的輕量 ping
+      agent_connected = (rmw_uros_ping_agent(100, 1) == RMW_RET_OK);
+    }
   }
 
-  // 不會到達，但留作參考
-  // rclc_executor_fini(&executor);
-  // rcl_publisher_fini(&state_pub, &node);
-  // rcl_subscription_fini(&cmd_sub, &node);
-  // rcl_timer_fini(&pub_timer);
-  // rcl_node_fini(&node);
   vTaskDelete(NULL);
 }
 
-// 硬體任務：非 micro-ROS（可保留，提高穩定性；要求是「只要一個 micro-ROS 任務」）
+// 硬體任務：非 micro-ROS（保留，提高穩定性；只存在一個 micro-ROS 任務）
 static void task_servo(void *arg)
 {
   (void)arg;
@@ -188,21 +197,37 @@ static void task_servo(void *arg)
   }
 }
 
+// LED 任務：未連線 -> 閃爍；已連線 -> 常亮
+static void task_led(void *arg)
+{
+  (void)arg;
+  pinMode(LED_PIN, OUTPUT);
+  bool level = false;
+  for (;;) {
+    if (agent_connected) {
+      digitalWrite(LED_PIN, HIGH);   // 連上：常亮
+      vTaskDelay(pdMS_TO_TICKS(200));
+    } else {
+      level = !level;                // 未連上：閃爍
+      digitalWrite(LED_PIN, level ? HIGH : LOW);
+      vTaskDelay(pdMS_TO_TICKS(250));
+    }
+  }
+}
+
 // ===================== Arduino 進入點 =====================
 void setup()
 {
   Serial.begin(115200);
   delay(200);
-  Serial.println("Booting (Pico 2 W)...");
 
   angle_q = xQueueCreate(8, sizeof(float));
   state_mtx = xSemaphoreCreateMutex();
 
-  // 啟動任務（只建立一個 micro-ROS 任務 + 一個硬體任務）
+  // 啟動任務（只建立一個 micro-ROS 任務 + 硬體任務 + LED 任務）
   xTaskCreate(task_micro_ros, "uros",  STACK_UROS / sizeof(StackType_t),  NULL, PRIO_UROS,  NULL);
   xTaskCreate(task_servo,     "servo", STACK_SERVO / sizeof(StackType_t), NULL, PRIO_SERVO, NULL);
-
-  Serial.println("Setup done.");
+  xTaskCreate(task_led,       "led",   STACK_LED   / sizeof(StackType_t), NULL, PRIO_LED,   NULL);
 }
 
 void loop()
