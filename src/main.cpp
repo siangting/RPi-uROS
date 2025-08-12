@@ -1,141 +1,212 @@
+#include <Arduino.h>
 #include <Wire.h>
-#include <SPI.h>
 #include <Adafruit_PWMServoDriver.h>
 
-// micro-ROS
+// ===== micro-ROS (Arduino/PlatformIO) =====
 #include <micro_ros_platformio.h>
 #include <rcl/rcl.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
-#include <rclc/subscription.h>
-#include <rclc/timer.h>
-#include <rclc/publisher.h>
-#include <rclc/node.h>
 #include <std_msgs/msg/float32.h>
 #include <rmw_microros/rmw_microros.h>
 
-// I2C & PWM
-#define I2C_SDA_PIN 0
-#define I2C_SCL_PIN 1
-#define SERVOMIN    150
-#define SERVOMAX    600
-#define SERVO_FREQ  50
-#define NUM_SERVOS  16
+// ===== FreeRTOS (Arduino library on RP2040) =====
+#include <FreeRTOS.h>
+#include <task.h>
+#include <queue.h>
+#include <semphr.h>
 
-Adafruit_PWMServoDriver pwm;
+// ===================== 可調整參數 =====================
+// Raspberry Pi Pico / Pico 2 W 預設 I2C 腳位：SDA=4, SCL=5
+#ifndef I2C_SDA_PIN
+#define I2C_SDA_PIN 4
+#endif
+#ifndef I2C_SCL_PIN
+#define I2C_SCL_PIN 5
+#endif
+#define SERVO_FREQ      50          // 50 Hz for analog servos
+#define SERVO_MIN_PULSE 150         // 0° (PCA9685 12-bit)
+#define SERVO_MAX_PULSE 600         // 180°
+#define NUM_SERVOS      6           // 同步多通道
 
-// rclc 物件
-rcl_allocator_t   allocator;
-rclc_support_t    support;
-rcl_node_t        node;
+// micro-ROS 連線：預設用 USB CDC Serial
+#define USE_SERIAL_TRANSPORT 1
 
-// Publisher: 實際回報的角度
-rcl_publisher_t         state_pub;
-std_msgs__msg__Float32  state_msg;
+// Task 設定（RP2040 無多核心 pin-to-core API，使用 xTaskCreate）
+#define STACK_UROS   (6 * 1024)
+#define STACK_SERVO  (3 * 1024)
+#define PRIO_UROS    3
+#define PRIO_SERVO   2
 
-// Subscriber: 外部下達的目標角度
-rcl_subscription_t      cmd_sub;
-std_msgs__msg__Float32  cmd_msg;
+// ===================== 全域物件 =====================
+static Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
-// Executor + Timer
-rclc_executor_t executor;
-rcl_timer_t    pub_timer;
+// micro-ROS
+static rcl_allocator_t allocator;
+static rclc_support_t support;
+static rcl_node_t node;
+static rcl_publisher_t state_pub;
+static rcl_subscription_t cmd_sub;
+static rcl_timer_t pub_timer;
+static rclc_executor_t executor;
+static std_msgs__msg__Float32 state_msg;
+static std_msgs__msg__Float32 cmd_msg; // Add this global variable
 
-// 當前脈衝與角度（在 loop 和 callback 間共用）
-volatile uint16_t current_pulse = SERVOMIN;
-volatile float    current_angle = 0.0f;
+// FreeRTOS 同步
+static QueueHandle_t angle_q;        // 接收要設定的角度（度）
+static SemaphoreHandle_t state_mtx;  // 保護 current_angle
+static volatile float current_angle_deg = 0.0f;  // 最新角度（由 SERVO 任務寫入）
 
-// 當收到新的目標角度，就立即更新伺服
-void cmd_callback(const void *msgin) {
+// ===================== 工具函式 =====================
+static inline uint16_t angle_to_pulse(float deg)
+{
+  if (deg < 0.0f) deg = 0.0f;
+  if (deg > 180.0f) deg = 180.0f;
+  const float k = (SERVO_MAX_PULSE - SERVO_MIN_PULSE) / 180.0f;
+  return (uint16_t)(SERVO_MIN_PULSE + deg * k);
+}
+
+// ===================== micro-ROS Callback =====================
+static void sub_cmd_callback(const void *msgin)
+{
   const std_msgs__msg__Float32 *m = (const std_msgs__msg__Float32 *)msgin;
-  float target = m->data;
-  // 限制在 [0,180]
-  if (target < 0.0f) target = 0.0f;
-  if (target > 180.0f) target = 180.0f;
-  // 計算脈衝
-  current_pulse = (uint16_t)((target * (SERVOMAX - SERVOMIN) / 180.0f) + SERVOMIN);
-  // 立刻更新所有通道
-  for (uint8_t ch = 0; ch < NUM_SERVOS; ch++) {
-    pwm.setPWM(ch, 0, current_pulse);
-  }
-  // 更新 shared 角度
-  current_angle = target;
-  Serial.print("CMD → Set angle: ");
-  Serial.println(target);
+  float target_deg = m->data;
+  // 將目標角度丟給 SERVO 任務處理硬體
+  xQueueSend(angle_q, &target_deg, 0);
 }
 
-// 定時（50 ms）把 current_angle 發佈出去
-void pub_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
+static void pub_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
+{
   (void)timer; (void)last_call_time;
-  state_msg.data = current_angle;
-  rcl_publish(&state_pub, &state_msg, NULL);
-  (void)rmw_uros_sync_session(100);
+  float copy;
+  if (xSemaphoreTake(state_mtx, pdMS_TO_TICKS(2)) == pdTRUE) {
+    copy = current_angle_deg;
+    xSemaphoreGive(state_mtx);
+  } else {
+    return; // 略過一次
+  }
+  state_msg.data = copy;
+  rcl_ret_t rc = rcl_publish(&state_pub, &state_msg, NULL);
+  (void)rc; // 如需偵錯可列印 rc
 }
 
-void setup() {
-  // 1. Serial & transport
+// ===================== Tasks =====================
+// 單一 micro-ROS 任務（executor + pub/sub + timer 都在這裡）
+static void task_micro_ros(void *arg)
+{
+  (void)arg;
+#if USE_SERIAL_TRANSPORT
   Serial.begin(115200);
   delay(100);
   set_microros_serial_transports(Serial);
+#else
+  // 範例：UDP（請依需求改 IP/PORT）
+  // IPAddress agent_ip(192,168,1,100);
+  // size_t agent_port = 8888;
+  // set_microros_udp_transports(agent_ip, agent_port);
+#endif
 
-  // 2. 等 Agent 上線
+  // 等待 Agent 就緒
   while (RMW_RET_OK != rmw_uros_ping_agent(100, 10)) {
     Serial.println("Waiting for micro-ROS Agent...");
-    delay(100);
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
-  Serial.println("Agent ready, initializing...");
+  Serial.println("Agent ready");
 
-  // 3. rclc 初始化
   allocator = rcl_get_default_allocator();
   rclc_support_init(&support, 0, NULL, &allocator);
-  rclc_node_init_default(&node, "pico_node", "", &support);
+  rclc_node_init_default(&node, "pico2w_servo_node", "", &support);
 
-  // 4. Publisher: /servo_angle_state
+  // Publisher: 回報目前角度
   rclc_publisher_init_default(
-    &state_pub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-    "servo_angle_state"
-  );
-  state_msg.data = 0.0f;
+      &state_pub,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+      "servo_angle_state");
 
-  // 5. Subscriber: /servo_angle_cmd
+  // Subscriber: 設定目標角度
   rclc_subscription_init_default(
-    &cmd_sub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-    "servo_angle_cmd"
-  );
+      &cmd_sub,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+      "servo_angle_cmd");
 
-  // 6. Timer + Executor
-  // 每 50 ms 發一次 state
-  rclc_timer_init_default(
-    &pub_timer,
-    &support,
-    RCL_MS_TO_NS(50),
-    pub_timer_callback
-  );
+  // Timer：固定頻率回報角度（20 Hz）
+  const unsigned timer_period_ms = 50;
+  rclc_timer_init_default(&pub_timer, &support, RCL_MS_TO_NS(timer_period_ms), pub_timer_callback);
+
+  // Executor
   rclc_executor_init(&executor, &support.context, 2, &allocator);
+  rclc_executor_add_subscription(&executor, &cmd_sub, &cmd_msg, &sub_cmd_callback, ON_NEW_DATA);
   rclc_executor_add_timer(&executor, &pub_timer);
-  rclc_executor_add_subscription(
-    &executor,
-    &cmd_sub,
-    &cmd_msg,
-    cmd_callback,
-    ON_NEW_DATA
-  );
 
-  // 7. I2C & PWM 初始化
+  // 進入 spin 迴圈（避免阻塞太久，使用 spin_some）
+  for (;;) {
+    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5));
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  // 不會到達，但留作參考
+  // rclc_executor_fini(&executor);
+  // rcl_publisher_fini(&state_pub, &node);
+  // rcl_subscription_fini(&cmd_sub, &node);
+  // rcl_timer_fini(&pub_timer);
+  // rcl_node_fini(&node);
+  vTaskDelete(NULL);
+}
+
+// 硬體任務：非 micro-ROS（可保留，提高穩定性；要求是「只要一個 micro-ROS 任務」）
+static void task_servo(void *arg)
+{
+  (void)arg;
+  // I2C + PCA9685 初始化（Pico 2 W）
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
   Wire.begin();
   pwm.begin();
   pwm.setPWMFreq(SERVO_FREQ);
 
-  Serial.println("Setup complete.");
+  // 初始角度
+  float target = 0.0f;
+  uint16_t pulse = angle_to_pulse(target);
+  for (uint8_t ch = 0; ch < NUM_SERVOS; ++ch) pwm.setPWM(ch, 0, pulse);
+  if (xSemaphoreTake(state_mtx, portMAX_DELAY) == pdTRUE) {
+    current_angle_deg = target;
+    xSemaphoreGive(state_mtx);
+  }
+
+  for (;;) {
+    // 等待新的目標角度（若 50ms 沒消息就略過）
+    if (xQueueReceive(angle_q, &target, pdMS_TO_TICKS(50)) == pdTRUE) {
+      pulse = angle_to_pulse(target);
+      for (uint8_t ch = 0; ch < NUM_SERVOS; ++ch) pwm.setPWM(ch, 0, pulse);
+      if (xSemaphoreTake(state_mtx, pdMS_TO_TICKS(2)) == pdTRUE) {
+        current_angle_deg = target;
+        xSemaphoreGive(state_mtx);
+      }
+    }
+  }
 }
 
-void loop() {
-  // spin executor 處理 publish/subscription callback
-  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+// ===================== Arduino 進入點 =====================
+void setup()
+{
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("Booting (Pico 2 W)...");
+
+  angle_q = xQueueCreate(8, sizeof(float));
+  state_mtx = xSemaphoreCreateMutex();
+
+  // 啟動任務（只建立一個 micro-ROS 任務 + 一個硬體任務）
+  xTaskCreate(task_micro_ros, "uros",  STACK_UROS / sizeof(StackType_t),  NULL, PRIO_UROS,  NULL);
+  xTaskCreate(task_servo,     "servo", STACK_SERVO / sizeof(StackType_t), NULL, PRIO_SERVO, NULL);
+
+  Serial.println("Setup done.");
+}
+
+void loop()
+{
+  // 主要邏輯都在 FreeRTOS 任務中
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
