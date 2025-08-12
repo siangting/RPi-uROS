@@ -63,7 +63,8 @@ static std_msgs__msg__Float32 cmd_msg; // <-- Add this global variable above
 static QueueHandle_t angle_q;        // 接收要設定的角度（度）
 static SemaphoreHandle_t state_mtx;  // 保護 current_angle
 static volatile float current_angle_deg = 0.0f;  // 最新角度（由 SERVO 任務寫入）
-static volatile bool agent_connected = false;    // micro-ROS Agent 連線狀態
+static volatile bool agent_connected = false; // 即時 ping 結果
+static volatile bool agent_active = false;    // 已進入穩定連線狀態
 
 // ===================== 工具函式 =====================
 static inline uint16_t angle_to_pulse(float deg)
@@ -98,67 +99,137 @@ static void pub_timer_callback(rcl_timer_t *timer, int64_t last_call_time)
   (void)rc; // 如需偵錯可列印 rc
 }
 
-// ===================== Tasks =====================
-// 單一 micro-ROS 任務（executor + pub/sub + timer 都在這裡）
+// ===== 新增：宣告 =====
+static bool microros_create_entities(void);
+static void microros_destroy_entities(void);
+
+// ===== 新增：建立 micro-ROS entities =====
+static bool microros_create_entities(void)
+{
+  allocator = rcl_get_default_allocator();
+
+  if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) return false;
+
+  if (rclc_node_init_default(&node, "pico2w_servo_node", "", &support) != RCL_RET_OK) {
+    rclc_support_fini(&support);
+    return false;
+  }
+
+  if (rclc_publisher_init_default(
+        &state_pub, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "servo_angle_state") != RCL_RET_OK) {
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+    return false;
+  }
+
+  if (rclc_subscription_init_default(
+        &cmd_sub, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "servo_angle_cmd") != RCL_RET_OK) {
+    rcl_publisher_fini(&state_pub, &node);
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+    return false;
+  }
+
+  const unsigned timer_period_ms = 50;
+  if (rclc_timer_init_default(&pub_timer, &support,
+        RCL_MS_TO_NS(timer_period_ms), pub_timer_callback) != RCL_RET_OK) {
+    rcl_subscription_fini(&cmd_sub, &node);
+    rcl_publisher_fini(&state_pub, &node);
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+    return false;
+  }
+
+  if (rclc_executor_init(&executor, &support.context, 2, &allocator) != RCL_RET_OK) {
+    rcl_timer_fini(&pub_timer);
+    rcl_subscription_fini(&cmd_sub, &node);
+    rcl_publisher_fini(&state_pub, &node);
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+    return false;
+  }
+
+  // 確保 cmd_msg 有可寫入空間
+  memset(&cmd_msg, 0, sizeof(cmd_msg));
+  rclc_executor_add_subscription(&executor, &cmd_sub, &cmd_msg, &sub_cmd_callback, ON_NEW_DATA);
+  rclc_executor_add_timer(&executor, &pub_timer);
+
+  return true;
+}
+
+// ===== 新增：銷毀 micro-ROS entities（供重連前清理） =====
+static void microros_destroy_entities(void)
+{
+  // 依相反順序釋放
+  rclc_executor_fini(&executor);
+  rcl_timer_fini(&pub_timer);
+  rcl_subscription_fini(&cmd_sub, &node);
+  rcl_publisher_fini(&state_pub, &node);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+}
+
+// ===== 修改：單一 micro-ROS 任務（加入可斷線重連） =====
 static void task_micro_ros(void *arg)
 {
   (void)arg;
+
 #if USE_SERIAL_TRANSPORT
   Serial.begin(115200);
   delay(100);
   set_microros_serial_transports(Serial);
 #else
-  // 範例：UDP（請依需求改 IP/PORT）
+  // 範例：UDP
   // IPAddress agent_ip(192,168,1,100);
   // size_t agent_port = 8888;
   // set_microros_udp_transports(agent_ip, agent_port);
 #endif
 
-  // 等待 Agent 就緒（LED 任務會依據 agent_connected 閃爍/常亮）
-  agent_connected = false;
-  while (RMW_RET_OK != rmw_uros_ping_agent(100, 10)) {
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-  agent_connected = true;
-
-  allocator = rcl_get_default_allocator();
-  rclc_support_init(&support, 0, NULL, &allocator);
-  rclc_node_init_default(&node, "pico2w_servo_node", "", &support);
-
-  // Publisher: 回報目前角度
-  rclc_publisher_init_default(
-      &state_pub,
-      &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-      "servo_angle_state");
-
-  // Subscriber: 設定目標角度
-  rclc_subscription_init_default(
-      &cmd_sub,
-      &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-      "servo_angle_cmd");
-
-  // Timer：固定頻率回報角度（20 Hz）
-  const unsigned timer_period_ms = 50;
-  rclc_timer_init_default(&pub_timer, &support, RCL_MS_TO_NS(timer_period_ms), pub_timer_callback);
-
-  // Executor
-  rclc_executor_init(&executor, &support.context, 2, &allocator);
-  rclc_executor_add_subscription(&executor, &cmd_sub, &cmd_msg, &sub_cmd_callback, ON_NEW_DATA);
-  rclc_executor_add_timer(&executor, &pub_timer);
-
-  // 進入 spin 迴圈（同時每 1 秒偵測 Agent 是否仍在線）
-  TickType_t lastPingCheck = xTaskGetTickCount();
   for (;;) {
-    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5));
-    vTaskDelay(pdMS_TO_TICKS(1));
+      agent_connected = false;
+      agent_active = false;
 
-    if (xTaskGetTickCount() - lastPingCheck >= pdMS_TO_TICKS(1000)) {
-      lastPingCheck = xTaskGetTickCount();
-      // timeout 0.1s、重試 1 次的輕量 ping
-      agent_connected = (rmw_uros_ping_agent(100, 1) == RMW_RET_OK);
-    }
+      // 等待 Agent 上線
+      while (rmw_uros_ping_agent(100, 10) != RMW_RET_OK) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+
+      if (!microros_create_entities()) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        continue;
+      }
+
+      // 已經建立 entity，但還要等到進入 loop 才算 active
+      agent_connected = true;
+      agent_active = true;  // 在這裡設為 true，表示進入正常 spin loop
+
+      TickType_t lastPingCheck = xTaskGetTickCount();
+      bool lost = false;
+
+      while (!lost) {
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5));
+        vTaskDelay(pdMS_TO_TICKS(1));
+
+        if (xTaskGetTickCount() - lastPingCheck >= pdMS_TO_TICKS(1000)) {
+          lastPingCheck = xTaskGetTickCount();
+          if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK &&
+              rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+            lost = true;
+          } else {
+            agent_connected = true; // ping 成功
+          }
+        }
+      }
+
+      // 斷線
+      agent_connected = false;
+      agent_active = false;
+      microros_destroy_entities();
+      vTaskDelay(pdMS_TO_TICKS(200));
   }
 
   vTaskDelete(NULL);
@@ -204,14 +275,14 @@ static void task_led(void *arg)
   pinMode(LED_PIN, OUTPUT);
   bool level = false;
   for (;;) {
-    if (agent_connected) {
-      digitalWrite(LED_PIN, HIGH);   // 連上：常亮
-      vTaskDelay(pdMS_TO_TICKS(200));
-    } else {
-      level = !level;                // 未連上：閃爍
-      digitalWrite(LED_PIN, level ? HIGH : LOW);
-      vTaskDelay(pdMS_TO_TICKS(250));
-    }
+      if (agent_active) {
+        digitalWrite(LED_PIN, HIGH); // 連上且沒 lost
+        vTaskDelay(pdMS_TO_TICKS(200));
+      } else {
+        level = !level; // 閃爍
+        digitalWrite(LED_PIN, level ? HIGH : LOW);
+        vTaskDelay(pdMS_TO_TICKS(250));
+      }
   }
 }
 
