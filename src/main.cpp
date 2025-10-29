@@ -1,141 +1,81 @@
-#include <Wire.h>
-#include <SPI.h>
-#include <Adafruit_PWMServoDriver.h>
+#include <Arduino.h>
 
-// micro-ROS
-#include <micro_ros_platformio.h>
-#include <rcl/rcl.h>
-#include <rclc/rclc.h>
-#include <rclc/executor.h>
-#include <rclc/subscription.h>
-#include <rclc/timer.h>
-#include <rclc/publisher.h>
-#include <rclc/node.h>
-#include <std_msgs/msg/float32.h>
-#include <rmw_microros/rmw_microros.h>
+// ==== RP2040 / Pico 2 W: UART1 腳位（合法組合：5/4, 9/8, 21/20）====
 
-// I2C & PWM
-#define I2C_SDA_PIN 0
-#define I2C_SCL_PIN 1
-#define SERVOMIN    150
-#define SERVOMAX    600
-#define SERVO_FREQ  50
-#define NUM_SERVOS  16
+#define RX_PIN 5
 
-Adafruit_PWMServoDriver pwm;
+#define TX_PIN 4
 
-// rclc 物件
-rcl_allocator_t   allocator;
-rclc_support_t    support;
-rcl_node_t        node;
+#define BusSerial Serial2   // 用 UART1
 
-// Publisher: 實際回報的角度
-rcl_publisher_t         state_pub;
-std_msgs__msg__Float32  state_msg;
+// STBus 協議
+#define HDR       0x55
+#define CMD_READ  0x1C
+#define CMD_MOVE  0x01
+#define CMD_LOAD  0x1F
 
-// Subscriber: 外部下達的目標角度
-rcl_subscription_t      cmd_sub;
-std_msgs__msg__Float32  cmd_msg;
+uint8_t chk(const uint8_t* b){
+  uint16_t s = 0;
+  for (uint8_t i = 2; i < b[3] + 2; i++) s += b[i];
+  return ~s;
+}
 
-// Executor + Timer
-rclc_executor_t executor;
-rcl_timer_t    pub_timer;
+void sendPack(uint8_t id, uint8_t cmd, const uint8_t* p, uint8_t n){
+  uint8_t buf[6 + 16];              // 預留空間避免 VLA；n <= 16
+  buf[0] = buf[1] = HDR;
+  buf[2] = id;
+  buf[3] = n + 3;
+  buf[4] = cmd;
+  for (uint8_t i = 0; i < n; i++) buf[5 + i] = p[i];
+  buf[5 + n] = chk(buf);
+  BusSerial.write(buf, 6 + n);
+}
 
-// 當前脈衝與角度（在 loop 和 callback 間共用）
-volatile uint16_t current_pulse = SERVOMIN;
-volatile float    current_angle = 0.0f;
-
-// 當收到新的目標角度，就立即更新伺服
-void cmd_callback(const void *msgin) {
-  const std_msgs__msg__Float32 *m = (const std_msgs__msg__Float32 *)msgin;
-  float target = m->data;
-  // 限制在 [0,180]
-  if (target < 0.0f) target = 0.0f;
-  if (target > 180.0f) target = 180.0f;
-  // 計算脈衝
-  current_pulse = (uint16_t)((target * (SERVOMAX - SERVOMIN) / 180.0f) + SERVOMIN);
-  // 立刻更新所有通道
-  for (uint8_t ch = 0; ch < NUM_SERVOS; ch++) {
-    pwm.setPWM(ch, 0, current_pulse);
+void scan(){
+  Serial.println("scan 1~30...");
+  for (uint8_t i = 1; i <= 30; i++) {
+    while (BusSerial.available()) BusSerial.read();
+    sendPack(i, CMD_READ, nullptr, 0);
+    delay(30);
+    if (BusSerial.available() >= 8) {
+      Serial.printf("  ID=%d OK\n", i);
+      while (BusSerial.available()) BusSerial.read();
+    }
   }
-  // 更新 shared 角度
-  current_angle = target;
-  Serial.print("CMD → Set angle: ");
-  Serial.println(target);
 }
 
-// 定時（50 ms）把 current_angle 發佈出去
-void pub_timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
-  (void)timer; (void)last_call_time;
-  state_msg.data = current_angle;
-  rcl_publish(&state_pub, &state_msg, NULL);
-  (void)rmw_uros_sync_session(100);
-}
-
-void setup() {
-  // 1. Serial & transport
+void setup(){
   Serial.begin(115200);
-  delay(100);
-  set_microros_serial_transports(Serial);
+  delay(50);
+  // 指定 UART 腳位 → 再 begin
+  BusSerial.setRX(5);
+  BusSerial.setTX(4);
+  BusSerial.begin(115200 , SERIAL_8N1);
+  delay(50);
 
-  // 2. 等 Agent 上線
-  while (RMW_RET_OK != rmw_uros_ping_agent(100, 10)) {
-    Serial.println("Waiting for micro-ROS Agent...");
-    delay(100);
-  }
-  Serial.println("Agent ready, initializing...");
+  // 上載扭力
+  uint8_t on = 1;
+  sendPack(1, CMD_LOAD, &on, 1);
+  delay(50);
 
-  // 3. rclc 初始化
-  allocator = rcl_get_default_allocator();
-  rclc_support_init(&support, 0, NULL, &allocator);
-  rclc_node_init_default(&node, "pico_node", "", &support);
-
-  // 4. Publisher: /servo_angle_state
-  rclc_publisher_init_default(
-    &state_pub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-    "servo_angle_state"
-  );
-  state_msg.data = 0.0f;
-
-  // 5. Subscriber: /servo_angle_cmd
-  rclc_subscription_init_default(
-    &cmd_sub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-    "servo_angle_cmd"
-  );
-
-  // 6. Timer + Executor
-  // 每 50 ms 發一次 state
-  rclc_timer_init_default(
-    &pub_timer,
-    &support,
-    RCL_MS_TO_NS(50),
-    pub_timer_callback
-  );
-  rclc_executor_init(&executor, &support.context, 2, &allocator);
-  rclc_executor_add_timer(&executor, &pub_timer);
-  rclc_executor_add_subscription(
-    &executor,
-    &cmd_sub,
-    &cmd_msg,
-    cmd_callback,
-    ON_NEW_DATA
-  );
-
-  // 7. I2C & PWM 初始化
-  Wire.setSDA(I2C_SDA_PIN);
-  Wire.setSCL(I2C_SCL_PIN);
-  Wire.begin();
-  pwm.begin();
-  pwm.setPWMFreq(SERVO_FREQ);
-
-  Serial.println("Setup complete.");
+  // 掃描 + 初次擺動
+  scan();
 }
 
-void loop() {
-  // spin executor 處理 publish/subscription callback
-  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+void loop(){
+  digitalWrite(LED_BUILTIN, HIGH);  // turn the LED on (HIGH is the voltage level)
+  delay(1000);                      // wait for a second
+  digitalWrite(LED_BUILTIN, LOW);   // turn the LED off by making the voltage LOW
+  delay(1000);                      // wait for a second
+  Serial.println("In loop");
+
+  uint8_t p0[]  = {0x00,0x00,100,0x00};
+  uint8_t p90[] = {0x77,0x01,100,0x00};
+
+  sendPack(1, CMD_MOVE, p0, 4);
+  Serial.println("Servo 1 → Move to 0°");
+  delay(500);
+  sendPack(1, CMD_MOVE, p90, 4);
+  Serial.println("Servo 1 → Move to 90°");
+  delay(500);
 }
