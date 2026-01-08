@@ -11,8 +11,9 @@
 #include <semphr.h>
 
 // == LED Pins ===
-#define LED1_PIN 2
-#define LED2_PIN 3
+#define GREEN_LED_PIN 12
+#define YELLOW_LED_PIN 11
+#define RED_LED_PIN 10
 
 // === micro-ROS Objects ===
 rcl_allocator_t allocator;
@@ -52,10 +53,10 @@ void setup()
   delay(100);
   set_microros_serial_transports(Serial);
 
-  pinMode(LED1_PIN, OUTPUT);
-  pinMode(LED2_PIN, OUTPUT);
-  digitalWrite(LED1_PIN, HIGH);
-  digitalWrite(LED2_PIN, LOW);
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  digitalWrite(RED_LED_PIN, HIGH);
+  digitalWrite(GREEN_LED_PIN, LOW);
 
   // Create mutex for LED and state protection
   led_mutex = xSemaphoreCreateMutex();
@@ -102,11 +103,11 @@ void loop()
 
   // Update LEDs based on current state (outside critical section)
   if (alive_copy) {
-    digitalWrite(LED1_PIN, LOW);
-    digitalWrite(LED2_PIN, HIGH);
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, HIGH);
   } else {
-    digitalWrite(LED1_PIN, HIGH);
-    digitalWrite(LED2_PIN, LOW);
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(GREEN_LED_PIN, LOW);
   }
 
   vTaskDelay(pdMS_TO_TICKS(50)); // FreeRTOS delay
