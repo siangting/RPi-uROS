@@ -16,8 +16,8 @@
 
 // ======= RP2040 / Pico UART1 =======
 // 合法組合：TX=4/RX=5、TX=8/RX=9、TX=20/RX=21
-#define RX_PIN 5
-#define TX_PIN 4
+#define TX_PIN 8
+#define RX_PIN 9
 
 #define BusSerial Serial2
 
@@ -57,7 +57,7 @@ void moveServoDeg(uint8_t id, float deg) {
   uint8_t p[4] = {
     (uint8_t)(pos & 0xFF),
     (uint8_t)(pos >> 8),
-    100, 0  // 100 ms
+    100, 0  
   };
   sendPack(id, CMD_MOVE, p, 4);
 }
@@ -86,8 +86,6 @@ void traj_callback(const void * msgin) {
   size_t n = pt.positions.size;
   if (n > NUM_SERVOS) n = NUM_SERVOS;
 
-  Serial.printf("[uROS] Got JointTrajectory: %u servos\n", (unsigned)n);
-
   for (size_t i = 0; i < n; i++) {
     float deg = (float) pt.positions.data[i];
     moveServoDeg(i + 1, deg);
@@ -112,7 +110,7 @@ bool create_entities() {
   rosidl_runtime_c__String__Sequence__init(&traj_msg.joint_names, NUM_SERVOS);
   char tmp[16];
   for (uint8_t i = 0; i < NUM_SERVOS; i++) {
-    sprintf(tmp, "joint_%u", i + 1);
+    sprintf(tmp, "servo_%u", i + 1);
     rosidl_runtime_c__String__assign(&traj_msg.joint_names.data[i], tmp);
   }
 
